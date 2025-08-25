@@ -18,27 +18,33 @@
     mov si, welcome_msg
     call print_string
 
-; Load second-stage loader from disk (sector 2) into 0000:8000
-    xor ax, ax
-    mov es, ax                  ; ES = 0 so ES:BX -> 0000:8000
-    mov bx, 0x8000
+; Load second-stage loader from disk (sector 1) into 0x0800:0x0000 (physical 0x8000)
+    mov ax, 0x0800
+    mov es, ax                  ; ES = 0x0800
+    mov bx, 0x0000              ; BX = 0x0000
 
     mov ah, 0x02                ; BIOS read sector(s)
     mov al, 1                   ; Read 1 sector (512 bytes)
     mov ch, 0                   ; Cylinder 0
-    mov cl, 2                   ; Start at sector 2 (sector numbers are 1-based)
+    mov cl, 1                   ; Start at sector 1 (sector numbers are 1-based)
     mov dh, 0                   ; Head 0
     mov dl, [boot_drive]        ; Use the boot drive provided by BIOS
     int 0x13                    ; BIOS interrupt for disk operations
-    
     jc disk_error               ; Jump if carry flag is set (error)
 
 ; Print success message
     mov si, load_success_msg
     call print_string
 
+; Set up segment registers for loader
+    mov ax, 0
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov sp, 0x7c00             ; Keep stack at bootloader area
+
 ; Jump to second-stage loader
-    jmp 0x0000:0x8000           ; Far jump to physical 0x0000:0x8000
+    jmp 0x0800:0x0000          ; Far jump to segment 0x0800, offset 0x0000
 
 ; Print string function
 print_string:
@@ -65,4 +71,4 @@ disk_error_msg db 'Disk read error!', 13, 10, 0
 
 ; Boot signature
 times 510-($-$$) db 0          ; Fill remaining bytes with zeros
-dw 0xaa55                      ; Boot signature 
+dw 0xaa55                      ; Boot signature

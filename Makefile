@@ -13,7 +13,8 @@ OBJCOPY = objcopy
 
 # Flags
 NASM_FLAGS = -f bin
-QEMU_FLAGS = -machine pc -boot c -drive file=os.img,if=ide,format=raw
+# QEMU flags for floppy disk
+QEMU_FLAGS = -machine pc -boot a -drive file=$(OS_IMAGE),if=floppy,format=raw
 
 # C++ compilation flags
 CXXFLAGS = -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pie -O2 -Wall -Wextra -std=c++11
@@ -32,6 +33,9 @@ BUILD_DIR = build
 SRC_DIR = src
 BOOT_DIR = boot
 
+# Kernel sectors
+KERNEL_SECTORS := $(shell echo $$((($(shell stat -c%s $(KERNEL_BIN)) + 511) / 512)))
+
 # Default target
 all: $(OS_IMAGE)
 
@@ -44,7 +48,7 @@ $(BOOTLOADER): bootloader.asm
 	$(NASM) $(NASM_FLAGS) -o $@ $<
 
 # Build the second-stage loader
-$(LOADER): $(BOOT_DIR)/loader.asm
+$(LOADER): $(BOOT_DIR)/loader.asm boot/kernel_sectors.inc
 	$(NASM) $(NASM_FLAGS) -o $@ $<
 
 # Build C++ startup code
@@ -71,12 +75,22 @@ $(KERNEL_ELF): $(BUILD_DIR)/crt0.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/keyboard.o
 $(KERNEL_BIN): $(BUILD_DIR)/crt0.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/keyboard.o $(BUILD_DIR)/terminal.o linker.ld
 	$(LD) $(LDFLAGS) --oformat binary -o $@ $(BUILD_DIR)/crt0.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/keyboard.o $(BUILD_DIR)/terminal.o
 
-# Create the OS image
+# Generate kernel sectors include file
+boot/kernel_sectors.inc: $(KERNEL_BIN)
+	echo "KERNEL_SECTORS equ $(KERNEL_SECTORS)" > $@
+
+# Create OS image
 $(OS_IMAGE): $(BOOTLOADER) $(LOADER) $(KERNEL_BIN)
-	dd if=/dev/zero of=$@ bs=512 count=2880
-	dd if=$(BOOTLOADER) of=$@ conv=notrunc
-	dd if=$(LOADER) of=$@ bs=512 seek=1 conv=notrunc
-	dd if=kernel.bin of=os.img bs=512 seek=2 conv=notrunc
+	@echo "Creating OS image..."
+	# Create a 10MB hard disk image
+	dd if=/dev/zero of=$(OS_IMAGE) bs=1M count=10 2>/dev/null
+	# Write bootloader to sector 0 (MBR)
+	dd if=$(BOOTLOADER) of=$(OS_IMAGE) bs=512 seek=0 count=1 conv=notrunc 2>/dev/null
+	# Write loader to sector 1
+	dd if=$(LOADER) of=$(OS_IMAGE) bs=512 seek=1 count=1 conv=notrunc 2>/dev/null
+	# Write kernel to sector 2 (multiple sectors)
+	dd if=$(KERNEL_BIN) of=$(OS_IMAGE) bs=512 seek=2 count=$(KERNEL_SECTORS) conv=notrunc 2>/dev/null
+	@echo "OS image created: $(OS_IMAGE)"
 
 # Run the OS in QEMU with VNC display (default)
 run: $(OS_IMAGE)
