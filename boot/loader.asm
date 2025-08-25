@@ -17,8 +17,9 @@ loader_start:
     mov si, seg_set_msg
     call serial_out
 
-    ; Ensure boot_drive is set by bootloader
-    ; (bootloader must do: mov [boot_drive], dl before jmp to loader)
+    ; Debug: Print before kernel load
+    mov si, debug_kernel_load_msg
+    call print_string
 
     ; Load kernel (sectors 2..N) to 0x100000
     mov word [kernel_seg], 0x1000
@@ -55,8 +56,16 @@ skip_inc_es:
     inc bl
     loop load_kernel_loop
 
+    ; Debug: Print after kernel load
+    mov si, debug_after_load_msg
+    call print_string
+
     ; Print PM switch message
     mov si, pm_msg
+    call print_string
+
+    ; Debug: Print before protected mode switch
+    mov si, debug_pm_msg
     call print_string
 
     ; Set up GDT in low memory
@@ -66,6 +75,10 @@ skip_inc_es:
     in al, 0x92
     or al, 2
     out 0x92, al
+
+    ; Debug: Print before kernel jump
+    mov si, debug_kernel_jump_msg
+    call print_string
 
     ; Enter protected mode
     mov eax, cr0
@@ -103,6 +116,10 @@ seg_set_msg db 'Set ES', 13, 10, 0
 read_ok_msg db 'Read OK', 13, 10, 0
 pm_msg db 'Switching to protected mode...', 13, 10, 0
 disk_error_msg db 'Loader: Disk read error!', 13, 10, 0
+debug_kernel_load_msg db 'DEBUG: Starting kernel load...', 13, 10, 0
+debug_after_load_msg db 'DEBUG: Kernel load complete.', 13, 10, 0
+debug_pm_msg db 'DEBUG: Switching to protected mode...', 13, 10, 0
+debug_kernel_jump_msg db 'DEBUG: Jumping to kernel...', 13, 10, 0
 boot_drive db 0    ; Must be set by bootloader: mov [boot_drive], dl
 
 align 8
