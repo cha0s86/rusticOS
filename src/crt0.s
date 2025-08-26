@@ -21,6 +21,11 @@ _start:
     
     # Set up stack
     mov $0x90000, %esp
+
+    # Debug: Write 'K' to top-left VGA
+    mov $0xb8000, %edi
+    mov $0x1f4b, %eax   # 'K' white on blue
+    mov %eax, (%edi)
     
     # Call C++ kernel main function
     call kernel_main
@@ -28,4 +33,4 @@ _start:
     # Should never return, but if it does, halt
 .hang:
     hlt
-    jmp .hang 
+    jmp .hang

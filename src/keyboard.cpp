@@ -94,7 +94,7 @@ bool KeyboardDriver::get_key_event(KeyEvent& event) {
     return true;
 }
 
-bool KeyboardDriver::is_key_pressed(uint8_t scan_code) {
+bool KeyboardDriver::is_key_pressed(uint8_t /*scan_code*/) {
     // Simple implementation - in a real OS, you'd track individual key states
     return false;
-} 
+}

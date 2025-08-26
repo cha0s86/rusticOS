@@ -1,6 +1,13 @@
 # RusticOS - Simple x86_64 Operating System
 
-A minimal operating system development environment built with NASM and QEMU for learning OS development concepts.
+A minimal operating system development environment built with NASM and QEMU for learning OS development concepts."
+"
+
+
+
+
+
+
 
 ## Features
 
@@ -36,38 +43,37 @@ sudo apt install nasm qemu-system-x86 make
 brew install nasm qemu make
 ```
 
-## Project Structure
+## Project structure
 
-```
-rusticOS/
-├── bootloader.asm    # BIOS bootloader (first sector)
-├── kernel.asm        # Simple kernel (loaded by bootloader)
-├── Makefile          # Build configuration
-├── build.sh          # Automated build script
-└── README.md         # This file
-```
+- `boot/`: stage-2 loader sources and artifacts
+- `src/`: kernel sources and startup code
+- `build/`: intermediate object files (generated)
+- `scripts/`: helper scripts to build/run/debug/clean
+- `docs/`: documentation
+- `config/`: configuration snippets (future use)
+- `tools/`: developer tools and utilities
+- `logs/`: runtime or emulator logs (gitignored recommended)
 
-## Quick Start
+## Common commands
 
-### Method 1: Using the build script (Recommended)
 ```bash
-chmod +x build.sh
-./build.sh
-```
+# Build everything
+scripts/build.sh
 
-### Method 2: Using Make directly
-```bash
-# Build the OS
-make
+# Run headless (serial)
+scripts/run.sh headless
 
-# Run in QEMU
-make run
+# Run with VNC display
+scripts/run.sh vnc
 
-# Run in debug mode
-make debug
+# Run with curses console
+scripts/run.sh curses
 
-# Clean build files
-make clean
+# Debug mode (QEMU + GDB stub)
+scripts/run.sh debug
+
+# Clean artifacts
+scripts/clean.sh
 ```
 
 ## How It Works

@@ -13,8 +13,8 @@ OBJCOPY = objcopy
 
 # Flags
 NASM_FLAGS = -f bin
-# QEMU flags for floppy disk
-QEMU_FLAGS = -machine pc -boot a -drive file=$(OS_IMAGE),if=floppy,format=raw
+# QEMU flags for hard disk
+QEMU_FLAGS = -machine pc -boot c -drive file=$(OS_IMAGE),if=ide,format=raw
 
 # C++ compilation flags
 CXXFLAGS = -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pie -O2 -Wall -Wextra -std=c++11
@@ -22,90 +22,92 @@ CFLAGS = -m32 -ffreestanding -fno-stack-protector -fno-pie -O2 -Wall -Wextra -st
 LDFLAGS = -nostdlib -T linker.ld -melf_i386
 
 # Files
-BOOTLOADER = bootloader.bin
-LOADER = boot/loader.bin
-KERNEL_ELF = kernel.elf
-KERNEL_BIN = kernel.bin
-OS_IMAGE = os.img
+OUT_DIR = out
+BOOTLOADER = $(OUT_DIR)/bootloader.bin
+LOADER = $(OUT_DIR)/loader.bin
+KERNEL_ELF = $(OUT_DIR)/kernel.elf
+KERNEL_BIN = $(OUT_DIR)/kernel.bin
+OS_IMAGE = $(OUT_DIR)/os.img
 
 # Directories
 BUILD_DIR = build
 SRC_DIR = src
 BOOT_DIR = boot
 
-# Kernel sectors
-KERNEL_SECTORS := $(shell echo $$((($(shell stat -c%s $(KERNEL_BIN)) + 511) / 512)))
+print-kernel-info: $(KERNEL_BIN)
+	@echo "Kernel size: $(shell stat -c%s $(KERNEL_BIN)) bytes"
+	@echo "Kernel sectors: $(shell expr \( $(shell stat -c%s $(KERNEL_BIN)) + 511 \) / 512)"
 
 # Default target
 all: $(OS_IMAGE)
 
-# Create build directory
+# Create build/output directories
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
+$(OUT_DIR):
+	mkdir -p $(OUT_DIR)
 
-# Build the bootloader
-$(BOOTLOADER): bootloader.asm
+# === Build rules for RusticOS ===
+
+# 1. Build bootloader (MBR, 16-bit)
+$(BOOTLOADER): $(BOOT_DIR)/bootloader.asm | $(OUT_DIR)
 	$(NASM) $(NASM_FLAGS) -o $@ $<
 
-# Build the second-stage loader
-$(LOADER): $(BOOT_DIR)/loader.asm boot/kernel_sectors.inc
+# 2. Build second-stage loader (loads kernel, switches to protected mode)
+$(LOADER): $(BOOT_DIR)/loader.asm boot/kernel_sectors.inc | $(OUT_DIR)
 	$(NASM) $(NASM_FLAGS) -o $@ $<
 
-# Build C++ startup code
+# 3. Build kernel startup (crt0), kernel, drivers, and terminal
 $(BUILD_DIR)/crt0.o: $(SRC_DIR)/crt0.s | $(BUILD_DIR)
 	$(CC) -c $(CFLAGS) $< -o $@
-
-# Build C++ kernel
 $(BUILD_DIR)/kernel.o: $(SRC_DIR)/kernel.cpp | $(BUILD_DIR)
 	$(CXX) -c $(CXXFLAGS) $< -o $@
-
-# Build keyboard driver
 $(BUILD_DIR)/keyboard.o: $(SRC_DIR)/keyboard.cpp | $(BUILD_DIR)
 	$(CXX) -c $(CXXFLAGS) $< -o $@
-
-# Build terminal
 $(BUILD_DIR)/terminal.o: $(SRC_DIR)/terminal.cpp | $(BUILD_DIR)
 	$(CXX) -c $(CXXFLAGS) $< -o $@
 
-# Link the kernel
-$(KERNEL_ELF): $(BUILD_DIR)/crt0.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/keyboard.o $(BUILD_DIR)/terminal.o linker.ld
+# 4. Link kernel ELF (entry at 0x100000)
+$(KERNEL_ELF): $(BUILD_DIR)/crt0.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/keyboard.o $(BUILD_DIR)/terminal.o linker.ld | $(OUT_DIR)
 	$(LD) $(LDFLAGS) -o $@ $(BUILD_DIR)/crt0.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/keyboard.o $(BUILD_DIR)/terminal.o
 
-# Convert ELF to binary for disk image
-$(KERNEL_BIN): $(BUILD_DIR)/crt0.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/keyboard.o $(BUILD_DIR)/terminal.o linker.ld
-	$(LD) $(LDFLAGS) --oformat binary -o $@ $(BUILD_DIR)/crt0.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/keyboard.o $(BUILD_DIR)/terminal.o
+# 5. Convert kernel ELF to raw binary for disk image
+$(KERNEL_BIN): $(KERNEL_ELF) | $(OUT_DIR)
+	$(OBJCOPY) -O binary $< $@
 
-# Generate kernel sectors include file
+# 6. Generate loader include for kernel sector count
 boot/kernel_sectors.inc: $(KERNEL_BIN)
-	echo "KERNEL_SECTORS equ $(KERNEL_SECTORS)" > $@
+	@echo "KERNEL_SECTORS equ $(shell expr \( $(shell stat -c%s $(KERNEL_BIN)) + 511 \) / 512)" > $@
 
-# Create OS image
-$(OS_IMAGE): $(BOOTLOADER) $(LOADER) $(KERNEL_BIN)
-	@echo "Creating OS image..."
-	# Create a 10MB hard disk image
-	dd if=/dev/zero of=$(OS_IMAGE) bs=1M count=10 2>/dev/null
-	# Write bootloader to sector 0 (MBR)
-	dd if=$(BOOTLOADER) of=$(OS_IMAGE) bs=512 seek=0 count=1 conv=notrunc 2>/dev/null
-	# Write loader to sector 1
-	dd if=$(LOADER) of=$(OS_IMAGE) bs=512 seek=1 count=1 conv=notrunc 2>/dev/null
-	# Write kernel to sector 2 (multiple sectors)
-	dd if=$(KERNEL_BIN) of=$(OS_IMAGE) bs=512 seek=2 count=$(KERNEL_SECTORS) conv=notrunc 2>/dev/null
-	@echo "OS image created: $(OS_IMAGE)"
+# 7. Create OS image (bootloader, loader, kernel)
+$(OS_IMAGE): $(BOOTLOADER) $(LOADER) $(KERNEL_BIN) | $(OUT_DIR)
+	@echo "\033[1;34m[INFO]\033[0m Creating OS image..."
+	dd if=/dev/zero of=$(OS_IMAGE) bs=1M count=10 conv=notrunc
+	dd if=$(BOOTLOADER) of=$(OS_IMAGE) bs=512 seek=0 count=1 conv=notrunc
+	dd if=$(LOADER) of=$(OS_IMAGE) bs=512 seek=1 count=1 conv=notrunc
+	dd if=$(KERNEL_BIN) of=$(OS_IMAGE) bs=512 seek=2 count=$(shell expr $(shell stat -c%s $(KERNEL_BIN)) + 511 / 512) conv=notrunc
+	@echo "\033[1;32m[SUCCESS]\033[0m OS image created: $(OS_IMAGE)"
 
+# ======================
 # Run the OS in QEMU with VNC display (default)
 run: $(OS_IMAGE)
+	@echo "\033[1;36m[RUN]\033[0m Starting QEMU with VNC display (127.0.0.1:0)..."
 	$(QEMU) $(QEMU_FLAGS) -display vnc=127.0.0.1:0
 
 # Run in QEMU headless (no display)
 run-headless: $(OS_IMAGE)
+	@echo "\033[1;36m[RUN]\033[0m Starting QEMU headless..."
 	$(QEMU) $(QEMU_FLAGS) -nographic
 
 # Run in QEMU with curses display (if available)
 run-curses: $(OS_IMAGE)
+	@echo "\033[1;36m[RUN]\033[0m Starting QEMU with curses display..."
 	$(QEMU) $(QEMU_FLAGS) -display curses
 
 # Debug mode with QEMU
+# ======================
 debug: $(OS_IMAGE)
+	@echo "\033[1;33m[DEBUG]\033[0m Starting QEMU in debug mode..."
 	$(QEMU) $(QEMU_FLAGS) -display vnc=127.0.0.1:0 -s -S
 
 # Build only the kernel (for development)
@@ -116,8 +118,7 @@ boot: $(BOOTLOADER) $(LOADER)
 
 # Clean build files
 clean:
-	rm -f $(BOOTLOADER) $(LOADER) $(KERNEL_ELF) $(KERNEL_BIN) $(OS_IMAGE)
-	rm -rf $(BUILD_DIR)
+	rm -rf $(OUT_DIR) $(BUILD_DIR)
 
 # Show help
 help:

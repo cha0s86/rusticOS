@@ -19,18 +19,19 @@ extern "C" void __cxa_pure_virtual() {
 }
 
 // Memory management stubs (minimal)
-void* operator new(std::size_t size) {
-    (void)size; // Suppress unused parameter warning
-    return nullptr; // Simple stub - no actual memory allocation
+void* operator new(std::size_t /*size*/) {
+    // Simple stub - no actual memory allocation
+    // Standard requires non-NULL unless throw(), so return a dummy pointer
+    return reinterpret_cast<void*>(0x100000); // or any non-null dummy address
 }
 
 void operator delete(void* ptr) noexcept {
     (void)ptr; // Suppress unused parameter warning
 }
 
-void* operator new[](std::size_t size) {
-    (void)size;
-    return nullptr;
+void* operator new[](std::size_t /*size*/) {
+    // Simple stub - no actual memory allocation
+    return reinterpret_cast<void*>(0x100000); // or any non-null dummy address
 }
 
 void operator delete[](void* ptr) noexcept {
@@ -156,4 +157,4 @@ extern "C" void kernel_main() {
     for (;;) {
         __asm__ __volatile__("hlt");
     }
-} 
+}
