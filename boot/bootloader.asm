@@ -3,49 +3,75 @@
 [bits 16]
 
 start:
-    ; Debug: Print a message to confirm bootloader is running
+    cli
+    ; Ensure DS=CS for string prints
+    push cs
+    pop ds
+
     mov si, debug_msg
     call print_string
 
+    ; Set up segments
     xor ax, ax
-    mov ds, ax
     mov es, ax
     mov ss, ax
     mov sp, 0x7c00
 
-    mov dl, 0x80           ; Assume hard disk (change to 0x00 for floppy)
-    mov [boot_drive], dl   ; Pass boot drive to loader
+    ; Preserve BIOS boot drive in DL
+    mov [boot_drive], dl
 
-    mov ax, 0x0800         ; ES = 0x0800
+    ; Load second-stage (CHS C=0,H=0,S=2) to 0x1000:0000
+    mov ax, 0x1000
     mov es, ax
-    mov bx, 0x0000         ; BX = 0x0000
-    mov ah, 0x02           ; BIOS read sector(s)
-    mov al, 1              ; Read 1 sector
-    mov ch, 0
-    mov cl, 1              ; Sector 1
-    mov dh, 0
+    xor bx, bx
+    mov ah, 0x02        ; read sectors
+    mov al, 1           ; 1 sector
+    xor ch, ch          ; cylinder 0
+    mov cl, 2           ; sector 2
+    xor dh, dh          ; head 0
     mov dl, [boot_drive]
     int 0x13
     jc disk_error
+
+    ; Debug: Print what we loaded
+    mov si, debug_loaded_msg
+    call print_string
+    
+    ; Print first few bytes loaded
+    mov al, [es:bx]
+    call print_hex_byte
+    mov al, [es:bx+1]
+    call print_hex_byte
+    mov al, [es:bx+2]
+    call print_hex_byte
+    mov al, [es:bx+3]
+    call print_hex_byte
+    mov si, newline_msg
+    call print_string
+
+    ; Quick sanity check: first byte non-zero
+    cmp byte [es:bx], 0
+    je disk_error
+    
+    ; Stronger check: first byte should be 0xFA (cli instruction)
+    cmp byte [es:bx], 0xFA
+    jne disk_error
 
     mov si, welcome_msg
     call print_string
     mov si, load_success_msg
     call print_string
 
-    ; Debug: Print a message before jumping
     mov si, jump_msg
     call print_string
 
-    ; Set up segments for loader
-    mov ax, 0x0800
+    ; Set up segment registers for the jump
+    mov ax, 0x1000
     mov ds, ax
     mov es, ax
-    mov ss, ax
-    mov sp, 0x8000
 
-    ; Jump to loader
-    jmp 0x0000      ; Jump to offset 0x0000 in segment 0x0800 (physical 0x8000)
+    ; Far jump to loader at 0x1000:0x0000
+    jmp 0x1000:0x0000
 
 print_string:
     lodsb
@@ -57,19 +83,44 @@ print_string:
 .done:
     ret
 
+print_hex_byte:
+    push ax
+    shr al, 4
+    call .nibble
+    pop ax
+    and al, 0x0f
+    call .nibble
+    mov al, ' '
+    mov ah, 0x0e
+    int 0x10
+    ret
+.nibble:
+    cmp al, 10
+    jl .digit
+    add al, 'a' - 10
+    jmp .print
+.digit:
+    add al, '0'
+.print:
+    mov ah, 0x0e
+    int 0x10
+    ret
+
 disk_error:
     mov si, disk_error_msg
     call print_string
     jmp $
 
 boot_drive db 0
+
 welcome_msg db 'RusticOS Bootloader Starting...', 13, 10, 0
 load_success_msg db 'Second-stage loader loaded!', 13, 10, 0
 disk_error_msg db 'Disk read error!', 13, 10, 0
 jump_msg db 'Attempting jump...', 13, 10, 0
 debug_msg db 'Bootloader is running...', 13, 10, 0
+debug_loaded_msg db 'Second-stage loaded to 0x1000:0000', 13, 10, 0
+newline_msg db 13, 10, 0
 
 times 510-($-$$) db 0
 
-; Boot signature
     dw 0xaa55
