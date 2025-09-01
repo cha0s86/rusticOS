@@ -79,13 +79,14 @@ $(KERNEL_BIN): $(KERNEL_ELF) | $(OUT_DIR)
 boot/kernel_sectors.inc: $(KERNEL_BIN)
 	@echo "KERNEL_SECTORS equ $(shell expr \( $(shell stat -c%s $(KERNEL_BIN)) + 511 \) / 512)" > $@
 
+
 # 7. Create OS image (bootloader, loader, kernel)
 $(OS_IMAGE): $(BOOTLOADER) $(LOADER) $(KERNEL_BIN) | $(OUT_DIR)
 	@echo "\033[1;34m[INFO]\033[0m Creating OS image..."
 	dd if=/dev/zero of=$(OS_IMAGE) bs=1M count=10 conv=notrunc
 	dd if=$(BOOTLOADER) of=$(OS_IMAGE) bs=512 seek=0 count=1 conv=notrunc
-	dd if=$(LOADER) of=$(OS_IMAGE) bs=512 seek=1 count=1 conv=notrunc
-	dd if=$(KERNEL_BIN) of=$(OS_IMAGE) bs=512 seek=2 count=$(shell expr $(shell stat -c%s $(KERNEL_BIN)) + 511 / 512) conv=notrunc
+	dd if=$(LOADER) of=$(OS_IMAGE) bs=512 seek=1 count=8 conv=notrunc
+	dd if=$(KERNEL_BIN) of=$(OS_IMAGE) bs=512 seek=32 count=$(shell expr \( $(shell stat -c%s $(KERNEL_BIN)) + 511 \) / 512) conv=notrunc
 	@echo "\033[1;32m[SUCCESS]\033[0m OS image created: $(OS_IMAGE)"
 
 # ======================
@@ -115,6 +116,12 @@ kernel: $(KERNEL_ELF)
 
 # Build only the boot components
 boot: $(BOOTLOADER) $(LOADER)
+
+# Build check: Ensure loader.bin does not start with ASCII 'S' (0x53)
+check-loader:
+	hexdump -C $(LOADER) | head -n 1 | grep -q '53' && \
+	  (echo "[ERROR] loader.bin starts with ASCII 'S' (0x53)!"; exit 1) || \
+	  echo "[OK] loader.bin does not start with ASCII 'S' (0x53)"
 
 # Clean build files
 clean:
