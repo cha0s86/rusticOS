@@ -101,39 +101,13 @@ static void show_help() {
 // Kernel entry point (called by crt0.s)
 // ----------------------------------------------------------------------------
 extern "C" void kernel_main() {
-    // Initialize terminal to a known state
+    // Welcome and instructions
     terminal.clear();
+    terminal.setColor(BLACK, LIGHT_GREEN); // black on green for header
+    terminal.write("Welcome to RusticOS kernel!\n\n");
+    terminal.setColor(LIGHT_GREY, BLACK);
+    terminal.write("Type to echo characters. Press ESC to exit.\n\n");
     terminal.setColor(LIGHT_GREEN, BLACK);
-
-    // Welcome banner
-    terminal.write("Welcome to RusticOS 32-bit Enhanced!\n");
-    terminal.write("Running in protected mode with C++ support\n\n");
-
-    // Basic system info
-    terminal.setColor(LIGHT_CYAN, BLACK);
-    terminal.write("System Information:\n");
-    terminal.write("- Architecture: x86 (32-bit protected mode)\n");
-    terminal.write("- VGA: Text mode 80x25 with cursor support\n");
-    terminal.write("- Stack: 0x90000\n");
-    terminal.write("- Kernel: Linked at 1 MiB (0x0010_0000)\n");
-    terminal.write("- Features: Keyboard input, cursor movement, scrolling\n\n");
-
-    // Status line and quick help
-    terminal.setColor(LIGHT_BROWN, BLACK);
-    terminal.write("Status: Ready. Press ESC to exit demo loop.\n\n");
-    show_help();
-
-    // Draw a simple UI box
-    terminal.setColor(LIGHT_BLUE, BLACK);
-    terminal.drawBox(0, 15, 79, 24, '#');
-    terminal.writeAt("Interactive Terminal - Type here:", 2, 16);
-
-    // Enable simple input mode and set cursor position
-    terminal.enableInput(true);
-    terminal.setCursor(2, 17);
-
-    // Prompt
-    terminal.setColor(WHITE, BLACK);
     terminal.write("> ");
 
     uint8_t last_key = 0;
@@ -141,21 +115,14 @@ extern "C" void kernel_main() {
 
     // Main kernel loop: poll keyboard and echo simple ASCII
     for (;;) {
-        // Poll the keyboard controller for a scan code
         uint8_t key = poll_keyboard();
-
-        // Very naive de-bounce: only react to changes
         if (key != 0 && key != last_key) {
             last_key = key;
-
-            // Handle a few special keys directly by scan code
             if (key == 0x01) { // ESC key
                 terminal.setColor(LIGHT_RED, BLACK);
                 terminal.write("\nExiting...\n");
                 break;
             }
-
-            // Convert a limited range of scan codes to ASCII (very simplified)
             char ascii = 0;
             if (key >= 0x02 && key <= 0x0D) {
                 const char* chars = "1234567890-=";
@@ -171,17 +138,14 @@ extern "C" void kernel_main() {
                 ascii = chars[key - 0x2C];
             } else if (key == 0x39) {
                 ascii = ' ';
-            } else if (key == 0x1C) { // Enter
+            } else if (key == 0x1C) {
                 ascii = '\n';
-            } else if (key == 0x0E) { // Backspace
+            } else if (key == 0x0E) {
                 ascii = '\b';
             }
-
-            // Echo the ASCII and handle line input behavior
             if (ascii != 0) {
                 if (ascii == '\n') {
                     terminal.write("\n> ");
-                    input_line++;
                 } else if (ascii == '\b') {
                     terminal.moveCursor(-1, 0);
                     terminal.putChar(' ');
@@ -191,17 +155,10 @@ extern "C" void kernel_main() {
                 }
             }
         }
-
-        // Halt CPU until next event; in a real OS, this would return on IRQs
         __asm__ __volatile__("hlt");
-
-        // Future work: scheduler, IRQ handling, syscalls, memory management, etc.
     }
-
-    // Graceful shutdown path (we never return to the loader)
-    terminal.setColor(LIGHT_GREEN, BLACK);
+    terminal.setColor(BLACK, LIGHT_GREEN); // black on green for shutdown
     terminal.write("\nKernel shutdown complete.\n");
-
     for (;;) {
         __asm__ __volatile__("hlt");
     }

@@ -15,6 +15,8 @@ OBJCOPY = objcopy
 NASM_FLAGS = -f bin
 # QEMU flags for hard disk
 QEMU_FLAGS = -machine pc -boot c -drive file=$(OS_IMAGE),if=ide,format=raw
+# Parallel build helper
+NPROCS := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
 # C++ compilation flags
 CXXFLAGS = -m32 -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-pie -O2 -Wall -Wextra -std=c++11
@@ -36,10 +38,10 @@ BOOT_DIR = boot
 
 print-kernel-info: $(KERNEL_BIN)
 	@echo "Kernel size: $(shell stat -c%s $(KERNEL_BIN)) bytes"
-	@echo "Kernel sectors: $(shell expr \( $(shell stat -c%s $(KERNEL_BIN)) + 511 \) / 512)"
+	@echo "Kernel sectors: $(KERNEL_SECTORS)"
 
 # Default target
-all: $(OS_IMAGE)
+all: $(OS_IMAGE) os.img
 
 # Create build/output directories
 $(BUILD_DIR):
@@ -49,13 +51,20 @@ $(OUT_DIR):
 
 # === Build rules for RusticOS ===
 
+# Compute loader/kernel sector counts
+LOADER_SECTORS = $(shell s=$(stat -c%s out/loader.bin 2>/dev/null || echo 0); if [ $$s -eq 0 ]; then echo 8; else echo $$(( ($$s + 511) / 512 )); fi)
+KERNEL_SECTORS = $(shell s=$(stat -c%s out/kernel.bin 2>/dev/null || echo 0); if [ $$s -eq 0 ]; then echo 0; else echo $$(( ($$s + 511) / 512 )); fi)
+
 # 1. Build bootloader (MBR, 16-bit)
-$(BOOTLOADER): $(BOOT_DIR)/bootloader.asm | $(OUT_DIR)
+# Compute loader sectors and provide to both bootloader and image layout
+$(BOOTLOADER): $(BOOT_DIR)/bootloader.asm $(LOADER) boot/loader_sectors.inc | $(OUT_DIR)
 	$(NASM) $(NASM_FLAGS) -o $@ $<
 
 # 2. Build second-stage loader (loads kernel, switches to protected mode)
-$(LOADER): $(BOOT_DIR)/loader.asm boot/kernel_sectors.inc | $(OUT_DIR)
-	$(NASM) $(NASM_FLAGS) -o $@ $<
+# Ensure the loader gets an accurate sector count computed from the built kernel.
+# Depend on $(KERNEL_BIN) so the size is available, and pass -DKERNEL_SECTORS to NASM.
+$(LOADER): $(BOOT_DIR)/loader.asm $(KERNEL_BIN) | $(OUT_DIR)
+	$(NASM) $(NASM_FLAGS) -DKERNEL_SIZE_BYTES=$(shell stat -c%s $(KERNEL_BIN)) -o $@ $<
 
 # 3. Build kernel startup (crt0), kernel, drivers, and terminal
 $(BUILD_DIR)/crt0.o: $(SRC_DIR)/crt0.s | $(BUILD_DIR)
@@ -75,19 +84,35 @@ $(KERNEL_ELF): $(BUILD_DIR)/crt0.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/keyboard.o
 $(KERNEL_BIN): $(KERNEL_ELF) | $(OUT_DIR)
 	$(OBJCOPY) -O binary $< $@
 
-# 6. Generate loader include for kernel sector count
-boot/kernel_sectors.inc: $(KERNEL_BIN)
-	@echo "KERNEL_SECTORS equ $(shell expr \( $(shell stat -c%s $(KERNEL_BIN)) + 511 \) / 512)" > $@
+# 6. Generate loader include files (guarded to allow -D override)
 
+boot/loader_sectors.inc: $(LOADER)
+	@echo "%ifndef LOADER_SECTORS" > $@
+	@echo "LOADER_SECTORS equ $(LOADER_SECTORS)" >> $@
+	@echo "%endif" >> $@
+
+# Write kernel sector count for loader
+boot/kernel_sectors.inc: out/kernel.bin
+	@echo "%ifndef KERNEL_SECTORS" > $@
+	@echo "KERNEL_SECTORS equ $(KERNEL_SECTORS)" >> $@
+	@echo "%endif" >> $@
 
 # 7. Create OS image (bootloader, loader, kernel)
 $(OS_IMAGE): $(BOOTLOADER) $(LOADER) $(KERNEL_BIN) | $(OUT_DIR)
 	@echo "\033[1;34m[INFO]\033[0m Creating OS image..."
-	dd if=/dev/zero of=$(OS_IMAGE) bs=1M count=10 conv=notrunc
-	dd if=$(BOOTLOADER) of=$(OS_IMAGE) bs=512 seek=0 count=1 conv=notrunc
-	dd if=$(LOADER) of=$(OS_IMAGE) bs=512 seek=1 count=8 conv=notrunc
-	dd if=$(KERNEL_BIN) of=$(OS_IMAGE) bs=512 seek=32 count=$(shell expr \( $(shell stat -c%s $(KERNEL_BIN)) + 511 \) / 512) conv=notrunc
-	@echo "\033[1;32m[SUCCESS]\033[0m OS image created: $(OS_IMAGE)"
+	@LS=$$(stat -c%s $(LOADER)); KS=$$(stat -c%s $(KERNEL_BIN)); \
+	 LSEC=$$(echo $$LS | awk '{printf "%d", int( ($$1+511)/512 ) }'); \
+	 KSEC=$$(echo $$KS | awk '{printf "%d", int( ($$1+511)/512 ) }'); \
+	 echo "\033[1;34m[INFO]\033[0m LOADER_SECTORS=$$LSEC KERNEL_SECTORS=$$KSEC"; \
+	 dd if=/dev/zero of=$(OS_IMAGE) bs=1M count=10 conv=notrunc; \
+	 dd if=$(BOOTLOADER) of=$(OS_IMAGE) bs=512 seek=0 count=1 conv=notrunc; \
+	 dd if=$(LOADER) of=$(OS_IMAGE) bs=512 seek=1 count=$$LSEC conv=notrunc; \
+	 dd if=$(KERNEL_BIN) of=$(OS_IMAGE) bs=512 seek=2 count=$$KSEC conv=notrunc; \
+	 echo "\033[1;32m[SUCCESS]\033[0m OS image created: $(OS_IMAGE)"
+
+# After building out/os.img, copy to project root for QEMU
+os.img: out/os.img
+	cp out/os.img os.img
 
 # ======================
 # Run the OS in QEMU with VNC display (default)
@@ -110,6 +135,11 @@ run-curses: $(OS_IMAGE)
 debug: $(OS_IMAGE)
 	@echo "\033[1;33m[DEBUG]\033[0m Starting QEMU in debug mode..."
 	$(QEMU) $(QEMU_FLAGS) -display vnc=127.0.0.1:0 -s -S
+
+# Fast build wrapper (uses available CPU cores)
+fast:
+	@echo "\033[1;34m[INFO]\033[0m Building in parallel with -j$(NPROCS)"
+	$(MAKE) -j$(NPROCS) all
 
 # Build only the kernel (for development)
 kernel: $(KERNEL_ELF)
@@ -137,6 +167,7 @@ help:
 	@echo "  run-headless- Build and run without display (headless)"
 	@echo "  run-curses  - Build and run with curses display"
 	@echo "  debug       - Build and run in QEMU debug mode"
+	@echo "  fast        - Build using parallel jobs (auto-detected core count)"
 	@echo "  clean       - Remove build files"
 	@echo "  help        - Show this help message"
 	@echo ""
@@ -146,4 +177,7 @@ help:
 	@echo ""
 	@echo "System GCC with 32-bit support is used for compilation"
 
-.PHONY: all boot kernel run run-headless run-curses debug clean help
+.PHONY: all boot kernel run run-headless run-curses debug clean help fast
+
+boot-qemu:
+	qemu-system-x86_64 -drive file=os.img,format=raw

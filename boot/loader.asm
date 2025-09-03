@@ -1,356 +1,303 @@
-; ============================================================================
-; RusticOS - Second-Stage Loader (Real Mode -> Protected Mode)
-; ----------------------------------------------------------------------------
-; Purpose:
-;   - Runs in 16-bit real mode at 0x10000 (loaded by the MBR boot sector)
-;   - Enables A20
-;   - Loads the 32-bit kernel from disk (from a fixed LBA) into memory
-;   - Builds and loads a minimal GDT
-;   - Enters 32-bit protected mode and halts (demo)
-;
-; Design Notes:
-;   - ORG is 0x10000, so labels are linear addresses based on this origin.
-;   - We use CHS reads via BIOS (INT 13h) and assume standard geometry:
-;       * Sectors per track (SPT) = 63
-;       * Heads per cylinder (HPC) = 16
-;     These match the image layout used by the Makefile.
-;   - Kernel is placed at fixed LBA 32 by the build (see Makefile).
-;   - Disk reads are done sector-by-sector with retry and CHS carry logic.
-;   - ES is advanced by paragraphs (0x20) each sector to avoid ES:BX wrap.
-;
-; Future Work (filesystem + language runtime):
-;   - Replace fixed-LBA kernel load with filesystem lookup (e.g., "/boot/kernel.bin").
-;   - Introduce a minimal FS driver (FAT12/16 or custom) to locate files by name.
-;   - After kernel init, hand off to your language runtime (VM/JIT) as PID 1.
-;
-; Safety:
-;   - DL (boot drive) is saved and restored for each BIOS call.
-;   - BH is cleared for BIOS teletype INT 10h (AH=0x0E) to select page 0.
-;   - CLD ensures string operations increment.
-;
-; ============================================================================
-
 [org 0x10000]
 [bits 16]
 
-%include "boot/kernel_sectors.inc"   ; KERNEL_SECTORS (generated from kernel size)
+; Determine kernel size in sectors
+; Priority:
+;   1) -D KERNEL_SIZE_BYTES=<bytes> on the NASM command line
+;   2) boot/kernel_sectors.inc must define KERNEL_SECTORS
+%ifndef KERNEL_SECTORS
+%ifdef KERNEL_SIZE_BYTES
+    %assign KERNEL_SECTORS ((KERNEL_SIZE_BYTES + 511) / 512)
+%else
+    %include "boot/kernel_sectors.inc"
+%endif
+%endif
 
-; --- Disk geometry assumptions (matches Makefile image layout) ---
-SPT equ 63                           ; Sectors per track
-HPC equ 16                           ; Heads per cylinder
+kernel_sectors      equ KERNEL_SECTORS
+SEG_BASE            equ 0x10000
 
-; --- Fixed disk layout ---
-; LBA 0:     MBR (boot sector)
-; LBA 1..31: Loader (we reserve space up to LBA 31)
-; LBA 32.. : Kernel (written by Makefile)
-KERNEL_LBA_START equ 32
-
-; ============================================================================
-; Entry Point (called by boot sector via far jump to 0x1000:0000)
-; ============================================================================
 loader_start:
-    cli                             ; interrupts off during setup
-
-    ; Set DS = CS (for position-independent data access), ES = DS
+    ; Real-mode init: DS = CS, stack to safe area
+    cli
     push cs
     pop ds
-    push ds
-    pop es
+    mov ax, 0x9000        ; Use a safe stack segment far from loader/data
+    mov ss, ax 
+    mov sp, 0xFFFE        ; Top of segment
+    cld
 
-    ; Real-mode stack in low memory (not used heavily here)
-    xor  ax, ax
-    mov  ss, ax
-    mov  sp, 0x7c00
-    cld                             ; ensure forward string ops
+    ; Save BIOS boot drive (DL)
+    mov [boot_drive], dl
 
-    xor  bh, bh                     ; BIOS teletype page 0
-    mov  [boot_drive], dl           ; preserve BIOS boot drive
+    ; Clear screen (BIOS)
+    mov ah, 0x00
+    mov al, 0x03
+    int 0x10
 
-    ; Print: Loader started
-    mov  si, loader_msg_start
-    call print_string
+    ; Print "Booting bootloader..." at row 2 (green on black)
+    mov ax, 0xb800
+    mov es, ax
+    mov di, (80*2*2)
+    mov si, bootloader_msg
+    mov ah, 0x02 ; green on black
+    call print_string_vga_color
 
-    ; Enable A20 line via port 0x92 (Fast A20)
-    in   al, 0x92
-    or   al, 0x02
-    out  0x92, al
+    ; Print "Starting loader..." on line 3 (green on black)
+    mov ax, 0xb800
+    mov es, ax
+    mov di, (80*3*2)
+    mov si, loader_msg
+    mov ah, 0x02 ; green on black
+    call print_string_vga_color
 
-    ; Print: Loading kernel
-    mov  si, loader_msg_loading_kernel
-    call print_string
+    ; Prepare DAP for INT 13h Extensions (LBA) reads
+    mov word [dap.count], 0              ; filled in loop
+    mov word [dap.buf_off], 0x0000
+    mov word [dap.buf_seg], 0x2000
+    mov dword [dap.lba_low], 2            ; start at LBA 2 (kernel offset in image)
+    mov dword [dap.lba_high], 0
 
-    ; Destination for kernel image: 0x2000:0000 (128 KiB), grows upward
-    mov  ax, 0x2000
-    mov  es, ax
-    xor  bx, bx                     ; keep BX=0 to avoid ES:BX wrap
+    ; Ensure DS points to 0x1000 for DS:SI DAP pointer
+    mov ax, 0x1000
+    mov ds, ax
 
-    ; Compute kernel CHS from fixed LBA (KERNEL_LBA_START)
-    mov  ax, KERNEL_LBA_START
-    mov  [kernel_lba], ax
+    ; Print "Loading kernel..." on line 4 (green on black)
+    mov ax, 0xb800
+    mov es, ax
+    mov di, (80*4*2)
+    mov si, loading_msg
+    mov ah, 0x02 ; green on black
+    call print_string_vga_color
 
-    ; --- Convert LBA -> CHS (for BIOS INT 13h CHS reads) ---
-    ; c = LBA / (SPT * HPC)
-    ; t = LBA % (SPT * HPC)
-    ; h = t / SPT
-    ; s = (t % SPT) + 1
-    mov  bx, (SPT*HPC)              ; sectors per cylinder
-    xor  dx, dx
-    mov  ax, [kernel_lba]
-    div  bx                         ; AX=cylinder, DX=remainder
-    mov  [cur_cyl], al              ; (low 8 bits; small images only)
+    ; Remaining sectors to read
+    mov bx, kernel_sectors
+    mov [remaining], bx
 
-    mov  bx, SPT
-    xor  ax, ax
-    mov  ax, dx
-    xor  dx, dx
-    div  bx                         ; AX=head, DX=sector index (0..SPT-1)
-    mov  [cur_head], al
-    mov  al, dl
-    inc  al                         ; sector number 1..SPT
-    mov  [cur_sec], al
+read_lba_loop:
+    mov bx, [remaining]
+    cmp bx, 0
+    je read_done
 
-    ; Number of sectors to read for the kernel
-    mov  di, KERNEL_SECTORS
+    ; Count = min(remaining, 127)  (BIOS often allows up to 127 per call)
+    mov ax, bx
+    cmp ax, 127
+    jbe .count_ok
+    mov ax, 127
+.count_ok:
+    mov [dap.count], ax
 
-.read_next_sector:
-    cmp  di, 0
-    jz   .all_read
+    ; INT 13h Extensions: AH=42h, DL=drive, ES:BX -> DAP
+    mov ax, 0x1000
+    mov es, ax
+    mov bx, (dap - SEG_BASE)
+    mov ah, 0x42
+    mov dl, [boot_drive]
+    int 0x13
+    jc disk_error
 
-    ; BIOS: Read 1 sector into ES:BX
-    mov  ah, 0x02                   ; read
-    mov  al, 1                      ; one sector per call
-    mov  ch, [cur_cyl]
-    mov  cl, [cur_sec]
-    mov  dh, [cur_head]
+    ; Advance buffer by count * 512 bytes -> segment += count * 32 paragraphs
+    mov ax, [dap.count]
+    shl ax, 5
+    add [dap.buf_seg], ax
 
-    push bx
-    mov  bp, 3                      ; retry count
-.try_read:
-    mov  dl, [boot_drive]
-    int  0x13
-    jnc  .ok
+    ; Advance LBA by count (add to 64-bit LBA)
+    mov ax, [dap.count]
+    add [dap.lba_low], ax
+    adc word [dap.lba_low+2], 0
+    adc word [dap.lba_high+0], 0
+    adc word [dap.lba_high+2], 0
 
-    ; On error: reset disk and retry
-    mov  ah, 0x00
-    mov  dl, [boot_drive]
-    int  0x13
-    dec  bp
-    jnz  .try_read
-    pop  bx
-    jmp  disk_error
-.ok:
-    pop  bx
+    ; Decrease remaining
+    sub [remaining], ax
+    jmp read_lba_loop
 
-    ; Debug progress: '.' per sector
-    mov  al, '.'
-    mov  ah, 0x0e
-    int  0x10
+read_done:
+    ; Verify first byte at 0x00020000
+    mov ax, 0x2000
+    mov es, ax
+    xor bx, bx
+    mov al, [es:bx]
+    cmp al, 0xFA
+    jne disk_error
 
-    ; Advance destination by one sector: ES += 0x20 paragraphs (512 bytes)
-    ; Keep BX = 0 to avoid ES:BX overflow; this is simpler than adjusting BX.
-    mov  ax, es
-    add  ax, 0x20
-    mov  es, ax
+    ; Print "Booting kernel..." on line 5 (green on black)
+    mov ax, 0xb800
+    mov es, ax
+    mov di, (80*5*2)
+    mov si, booting_msg
+    mov ah, 0x02 ; green on black
+    call print_string_vga_color
 
-    ; Advance CHS -> next sector, with carry to head and cylinder
-    inc  byte [cur_sec]
-    cmp  byte [cur_sec], (SPT+1)    ; sectors are 1..SPT
-    jl   .no_sec_carry
-    mov  byte [cur_sec], 1
-    inc  byte [cur_head]
-    cmp  byte [cur_head], HPC       ; heads 0..HPC-1
-    jl   .no_sec_carry
-    mov  byte [cur_head], 0
-    inc  byte [cur_cyl]
-.no_sec_carry:
+    ; DEBUG: Print "PM jump" on line 6 before protected mode switch
+    mov ax, 0xb800
+    mov es, ax
+    mov di, (80*6*2)
+    mov si, pm_jump_msg
+    mov ah, 0x02 ; green on black
+    call print_string_vga_color
 
-    dec  di
-    jmp  .read_next_sector
-
-.all_read:
-    ; Print newline after progress dots
-    mov  al, 13
-    mov  ah, 0x0e
-    int  0x10
-    mov  al, 10
-    mov  ah, 0x0e
-    int  0x10
-
-    ; Print: Kernel loaded
-    mov  si, kernel_loaded_msg
-    call print_string
-
-    ; Optional debug: print first 4 bytes of kernel in hex
-    mov  si, debug_kernel_msg
-    call print_string
-    mov  ax, 0x2000
-    mov  es, ax
-    mov  al, [es:0]
-    call print_hex_byte
-    mov  al, [es:1]
-    call print_hex_byte
-    mov  al, [es:2]
-    call print_hex_byte
-    mov  al, [es:3]
-    call print_hex_byte
-    mov  si, newline_msg
-    call print_string
-
-    ; ------------------------------------------------------------------------
-    ; Enter Protected Mode
-    ; ------------------------------------------------------------------------
-
-    ; Load GDT (static descriptor; base is linear due to ORG 0x10000)
-    ; GDT layout: null, flat code (0x08), flat data (0x10)
+    ; Set up GDT for flat 32-bit protected mode
     lgdt [gdt_descriptor]
 
-    ; Print: Switching to protected mode
-    mov  si, loader_msg_pm_switch
-    call print_string
+    ; Enable A20 via port 0x92
+    in al, 0x92
+    or al, 0x02
+    out 0x92, al
 
-    ; Set PE bit in CR0 (keep interrupts disabled)
-    mov  eax, cr0
-    or   eax, 1
-    mov  cr0, eax
+    ; Enter protected mode
+    cli
+    mov eax, cr0
+    or eax, 1
+    mov cr0, eax
 
-    ; Far jump to load 32-bit code segment selector (0x08)
-    ; This flushes the prefetch queue and commits the new CS.
-    ; Emit exact bytes for 32-bit far jump to ensure correct encoding on all tools:
-    ; 66 EA <offset32> <selector16>
-    db 0x66, 0xEA
-    dd protected_mode_entry
-    dw 0x0008
+    ; Far jump to 32-bit code segment to flush prefetch queue
+    jmp dword 0x08:protected_mode_entry
 
-; ============================================================================
-; Helpers (16-bit real mode)
-; ============================================================================
+[bits 32]
+protected_mode_entry:
+    ; DEBUG: Print "PM entry" at VGA row 7
+    mov ax, 0x10
+    mov es, ax
+    mov edi, (0xB8000 + 80*7*2)
+    mov esi, pm_entry_msg
+    mov ah, 0x02 ; green on black
+    call print_string_vga_color32
 
-; print_string: prints ASCIIZ string at DS:SI using BIOS teletype
-print_string:
+    ; Flat data segments
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+
+    ; 32-bit stack (same as before)
+    mov esp, 0x0090000
+
+    ; Copy kernel from 0x00020000 to 0x00100000
+    mov esi, 0x00020000
+    mov edi, 0x00100000
+    mov ecx, (kernel_sectors * 128)     ; sectors * 512 bytes / 4 bytes per dword
+    rep movsd
+
+    ; Verify copy: first byte at 0x00100000
+    mov eax, dword [0x00100000]
+    cmp al, 0xFA
+    jne pm_copy_error
+
+    ; DEBUG: Print "Kernel jump" at VGA row 8
+    mov ax, 0x10
+    mov es, ax
+    mov edi, (0xB8000 + 80*8*2)
+    mov esi, kernel_jump_msg
+    mov ah, 0x02 ; green on black
+    call print_string_vga_color32
+
+    ; Jump to kernel entry (linked for 0x00100000)
+    jmp dword 0x08:0x00100000
+
+pm_copy_error:
+    ; 32-bit: print E2 and halt
+    mov ax, 0x10
+    mov es, ax
+    mov edi, 0
+    mov al, 'E'
+    mov ah, 0x04
+    stosw
+    mov al, '2'
+    stosw
+.halt32:
+    cli
+    hlt
+    jmp .halt32
+
+[bits 16]
+disk_error:
+    mov ax, 0xb800
+    mov es, ax
+    mov di, 0
+    mov al, 'E'
+    mov ah, 0x04 ; red on black
+    stosw
+    mov al, 'R'
+    stosw
+    mov al, 'R'
+    stosw
+    cli
+.halt:
+    hlt
+    jmp .halt
+
+; Messages
+bootloader_msg db 'Booting bootloader...',0
+loader_msg     db 'Starting loader...',0
+loading_msg    db 'Loading kernel...',0
+booting_msg    db 'Booting kernel...',0
+pm_jump_msg    db 'PM jump...',0
+pm_entry_msg   db 'PM entry...',0
+kernel_jump_msg db 'Kernel jump...',0
+
+; Minimal VGA print routine (SI=string, DI=offset, AH=color)
+print_string_vga_color:
     lodsb
-    or   al, al
-    jz   .done
-    mov  ah, 0x0e
-    int  0x10
-    jmp  print_string
+    or al, al
+    jz .done
+    stosw
+    jmp print_string_vga_color
 .done:
     ret
 
-; print_hex_byte: prints AL as two lowercase hex digits and a trailing space
-print_hex_byte:
-    push ax
-    shr  al, 4
-    call .nibble
-    pop  ax
-    and  al, 0x0f
-    call .nibble
-    mov  al, ' '
-    mov  ah, 0x0e
-    int  0x10
-    ret
-.nibble:
-    cmp  al, 10
-    jl   .digit
-    add  al, 'a' - 10
-    jmp  .print
-.digit:
-    add  al, '0'
-.print:
-    mov  ah, 0x0e
-    int  0x10
+; Minimal VGA print routine for 32-bit (ES:EDI, ESI=string, AH=color)
+print_string_vga_color32:
+    lodsb
+    or al, al
+    jz .done
+    stosw
+    jmp print_string_vga_color32
+.done:
     ret
 
-; ---------------------------------------------------------------------------
-; Messages (ASCIIZ)
-; ---------------------------------------------------------------------------
-loader_msg_start          db 'Loader: started', 13, 10, 0
-loader_msg_loading_kernel db 'Loader: loading kernel...', 13, 10, 0
-kernel_loaded_msg         db 'Loader: kernel loaded', 13, 10, 0
-loader_msg_pm_switch      db 'Loader: switching to protected mode', 13, 10, 0
-debug_kernel_msg          db 'Loader: kernel bytes: ', 0
-newline_msg               db 13, 10, 0
-
-; ---------------------------------------------------------------------------
-; State / Variables
-; ---------------------------------------------------------------------------
-boot_drive db 0                ; BIOS boot drive (DL)
-cur_cyl    db 0                ; current cylinder
-cur_head   db 0                ; current head
-cur_sec    db 3                ; current sector (1..63)
-
-pm_offset:
-    dd 0        ; (unused placeholder)
-
-jmp_target:
-    dd 0        ; (unused placeholder)
-
-pm_entry_addr:
-    dd 0        ; (unused placeholder)
-
-kernel_lba dw 0                ; LBA of kernel start
-
-; ============================================================================
-; GDT (flat 4GB code/data) and descriptor
-; ============================================================================
-
+; ----------------------------------------------------------------------
+; Data and tables
+; ----------------------------------------------------------------------
 align 8
-;           63         47         31         15          0
-;           +----------+----------+----------+-----------+
-; Null    : |                0 (unused)                  |
-; Code    : | base=0 limit=4GB gran=4K D=32 type=RX     |
-; Data    : | base=0 limit=4GB gran=4K D=32 type=RW     |
-;           +----------+----------+----------+-----------+
-
 gdt_start:
-    dq 0x0000000000000000         ; null descriptor
-    dq 0x00cf9a000000ffff         ; code: base=0, limit=4GB, 32-bit, RX
-    dq 0x00cf92000000ffff         ; data: base=0, limit=4GB, 32-bit, RW
+    dq 0x0000000000000000          ; null descriptor
+    dq 0x00CF9A000000FFFF          ; code: base=0, limit=4GB, 32-bit, gran=4KB
+    dq 0x00CF92000000FFFF          ; data: base=0, limit=4GB, 32-bit, gran=4KB
 gdt_end:
 
 gdt_descriptor:
     dw gdt_end - gdt_start - 1
     dd gdt_start
 
-; ============================================================================
-; 32-bit Protected Mode Entry
-; ============================================================================
-[bits 32]
-protected_mode_entry:
-    ; We're now executing with PE=1; set up data segments and stack.
-    ; Load flat data segments and set up a stack BEFORE any memory writes
-    mov  ax, 0x10                ; data selector
-    mov  ds, ax
-    mov  es, ax
-    mov  fs, ax
-    mov  gs, ax
-    mov  ss, ax
-    mov  esp, 0x90000            ; 576 KiB stack top
+; DAP: Disk Address Packet for INT 13h extensions
+; Layout (16 bytes):
+;  offset  size  field
+;      0     1   size (0x10)
+;      1     1   reserved (0)
+;      2     2   count (sectors to read)
+;      4     2   buffer offset
+;      6     2   buffer segment
+;      8     8   starting LBA (qword)
+dap:
+    db 0x10
+    db 0x00
+.count:    dw 0
+.buf_off:  dw 0
+.buf_seg:  dw 0
+.lba_low:  dd 0
+.lba_high: dd 0
 
-    ; Debug: show we reached PM (write to VGA text buffer)
-    mov  eax, 0xb8000
-    mov  word [eax], 0x1f50      ; 'P' white on blue
+; Variables
+boot_drive    db 0
+remaining     dw 0
 
-    mov  eax, 0xb8002
-    mov  word [eax], 0x1f53      ; 'S' white on blue
-
-    mov  eax, 0xb8004
-    mov  word [eax], 0x1f54      ; 'T' white on blue
-
-    ; Halt here (demo)
-    ; Future: jump to kernel entry at 0x0010_0000 (per linker script), or
-    ; call into a small loader that relocates/starts the kernel.
-    cli
-    hlt
-
-; ============================================================================
-; Error Handling
-; ============================================================================
-[bits 16]
-disk_error:
-    mov  si, disk_error_msg
-    call print_string
-.hang:
-    hlt
-    jmp  .hang
-
-disk_error_msg db 'Loader: disk read error', 13, 10, 0
+; Pad loader to exactly 512 or 1024 bytes
+%if ($-$$) < 510
+    times 510-($-$$) db 0
+    dw 0xaa55
+%else
+    times 1022-($-$$) db 0
+    dw 0xaa55
+%endif
