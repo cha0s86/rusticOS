@@ -119,10 +119,9 @@ extern "C" void kernel_main() {
     // Set colors for normal text
     terminal.setColor(TerminalColor::GREEN, TerminalColor::BLACK);
     
-    // Add extra line before welcome message
-    terminal.write("\n");
-    
     // Print welcome message
+    terminal.write("\n");
+");
     terminal.write("Welcome to RusticOS!\n");
     terminal.write("Type 'help' for available commands.\n");
     terminal.write("Root filesystem mounted at '/'\n\n");
